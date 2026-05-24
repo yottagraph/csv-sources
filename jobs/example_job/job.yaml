@@ -79,10 +79,10 @@
 #                      / cache eviction.
 
 name: example-job
-cpu: "1"
-memory: "1Gi"
+cpu: '1'
+memory: '1Gi'
 max_retries: 1
-task_timeout: "30m"
+task_timeout: '30m'
 parallelism: 1
 task_count: 1
 
@@ -98,10 +98,10 @@ task_count: 1
 # schedule_timezone: "UTC"
 
 env:
-  # Custom env (see header comment for ${secret://...} syntax):
-  EXAMPLE_FLAG: "true"
-  # DB_PASS: ${secret://my-db-pass/latest}
-  # OPTIONAL_KEY: ${secret://maybe-missing/1?}
+    # Custom env (see header comment for ${secret://...} syntax):
+    EXAMPLE_FLAG: 'true'
+    # DB_PASS: ${secret://my-db-pass/latest}
+    # OPTIONAL_KEY: ${secret://maybe-missing/1?}
 
 # Uncomment to send Slack notifications when this job finishes:
 # notify:
