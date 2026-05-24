@@ -1,0 +1,37 @@
+# Broadchurch project configuration
+# Auto-generated during tenant provisioning.
+
+gcp:
+  project: broadchurch
+  region: us-central1
+  staging_bucket: broadchurch-agent-staging
+  github_deploy_sa: github-deploy@broadchurch.iam.gserviceaccount.com
+
+tenant:
+  project_name: "csv-sources"
+  display_name: "CSV Sources"
+  org_id: "org_k9Uy5G5qFE6YilKi"
+  service_account: "tenant-k9uy5g5qfe6yilki@broadchurch.iam.gserviceaccount.com"
+
+gateway:
+  url: "https://broadchurch-portal-194773164895.us-central1.run.app"
+  qs_api_key: "2ee9b437503bd9a2b8804f9769723bca9b1af5198ca68b0d3cdfe85dd7ef1360"
+
+query_server:
+  url: "https://query.pip.prod.g.lovelace.ai"
+  audience: ""
+
+auth:
+  client_id: "6Gtv6UMVX1dVv5bIVCN1FZjnWYzatT7z"
+  audience: ""
+
+aether:
+  data_mode: "api-mcp"
+
+agents: {}
+
+# Compute jobs (Cloud Run Jobs) registered with the Portal.
+jobs: {}
+
+# Cloud Workflows registered with the Portal.
+workflows: {}
