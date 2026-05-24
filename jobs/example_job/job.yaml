@@ -1,0 +1,124 @@
+# Compute job manifest — read by the deploy workflow and the Portal.
+#
+# This file is the contract between your job's code and the BC platform.
+# Any field you set here flows into the Cloud Run Job (or K8s Job on the
+# per-tenant GKE cluster) spec, the Cloud Scheduler / K8s CronJob entry
+# (if `schedule` is set), and the Portal's Compute Jobs tab.
+#
+# See `docs/COMPUTE_JOBS.md` (broadchurch repo, link in `/deploy_job`)
+# for the full schema reference. The validator in
+# `scripts/validate-job-manifest.py` is the canonical enforcer and
+# rejects unknown fields, malformed durations, secret-ref typos, etc.
+# at deploy time with line-level error messages.
+#
+# Required:
+#   name:              Job name (lowercase, hyphenated, max 49 chars).
+#                      Defaults to the directory name if omitted.
+#
+# Runner:
+#   runner:            'cloud_run' (default) | 'k8s_job'
+#                      Cloud Run is the right answer for ~all jobs.
+#                      Switch to 'k8s_job' only when you've outgrown
+#                      Cloud Run's 24h / 8 vCPU / 32GB ceiling (GPU,
+#                      multi-day runs, etc.) — see COMPUTE_JOBS.md
+#                      "Escalation: K8s Jobs".
+#
+# Optional (resources):
+#   cpu:               CPU per task as a number-string ("1", "2", "4",
+#                      "8" for Cloud Run; "16", "32" for K8s Jobs).
+#                      Default: "1".
+#   memory:            Memory per task ("512Mi", "1Gi", "8Gi", "32Gi", ...).
+#                      Default: "1Gi".
+#   max_retries:       Per-task retry count (0-10). Default: 1.
+#   task_timeout:      Single-unit duration ("300s", "30m", "1h", "12h").
+#                      Cloud Run caps at "24h"; K8s Jobs run as long as
+#                      the pod stays alive. Default: "1h".
+#   parallelism:       Tasks running concurrently. Default: 1.
+#   task_count:        Total task count (for sharded work). Default: 1.
+#   provisioning_model: 'standard' (default) | 'spot'.
+#                      K8s-Jobs-only — Cloud Run Jobs don't support Spot.
+#                      Spot trades preemption risk for ~70% cost savings;
+#                      use for retry-safe / checkpointable work.
+#
+# Optional (trigger):
+#   schedule:          5-field cron expression ("0 2 * * *").
+#                      Omit for ad-hoc / workflow-triggered only.
+#                      Cloud Run only for now; K8s CronJob dispatch
+#                      lands in PR-A3-v2 (Linear ENG-550).
+#   schedule_timezone: IANA timezone ("America/New_York"). Default: "UTC".
+#
+# Optional (env):
+#   env:               Map of UPPER_SNAKE_CASE env vars passed to every
+#                      task. Values are coerced to strings at deploy
+#                      time. Three reference syntaxes:
+#                        KEY: literal-value
+#                        KEY: ${secret://name/version}     # required
+#                        KEY: ${secret://name/version?}    # optional;
+#                                                          # missing OK
+#                      Standard env (ORG_ID, GATEWAY_URL,
+#                      QUERY_SERVER_URL, GOOGLE_CLOUD_PROJECT,
+#                      DATABASE_URL, BIGQUERY_DATASET, BIGQUERY_LOCATION)
+#                      is injected automatically — don't restate it here.
+#
+# Optional (notify):
+#   notify:            Slack/email notification config rendered server-
+#                      side by the platform when an execution finishes.
+#                      Both `on_failure` and `on_success` accept the
+#                      same target shape. Artifacts are uploaded by the
+#                      runtime to a per-execution GCS prefix and
+#                      surfaced as signed-URL links in the notification.
+#   notify.signed_url_ttl: Lifetime of the artifact signed URLs.
+#                      Default: "24h".
+#
+# Optional (post_steps):
+#   post_steps:        Inline scripts that run after the main task
+#                      finishes, in order. Each step's `on_nonzero_exit`
+#                      decides whether a nonzero exit aborts the
+#                      execution ('fail', default) or just warns
+#                      ('warn'). Useful for cleanup / artifact upload
+#                      / cache eviction.
+
+name: example-job
+cpu: "1"
+memory: "1Gi"
+max_retries: 1
+task_timeout: "30m"
+parallelism: 1
+task_count: 1
+
+# Uncomment to escalate to K8s Jobs (heavy compute, GPU, multi-day):
+# runner: k8s_job
+# cpu: "16"
+# memory: "64Gi"
+# task_timeout: "12h"
+# provisioning_model: spot          # Spot nodepool selector + tolerations
+
+# Uncomment to run on a cron schedule (Cloud Run only for now):
+# schedule: "0 2 * * *"          # 2:00 AM daily, UTC
+# schedule_timezone: "UTC"
+
+env:
+  # Custom env (see header comment for ${secret://...} syntax):
+  EXAMPLE_FLAG: "true"
+  # DB_PASS: ${secret://my-db-pass/latest}
+  # OPTIONAL_KEY: ${secret://maybe-missing/1?}
+
+# Uncomment to send Slack notifications when this job finishes:
+# notify:
+#   on_failure:
+#     slack: "#bc-alerts"
+#   on_success:
+#     slack: "#bc-jobs"
+#   artifacts:
+#     - path: /tmp/report.html          # task-local file
+#       slack_link: "Report"
+#     - gcs: gs://my-bucket/report.csv  # already-uploaded GCS object
+#       slack_link: "CSV"
+#   signed_url_ttl: "24h"
+
+# Uncomment to run cleanup scripts after the main task:
+# post_steps:
+#   - script: |
+#       echo "cleaning up scratch dir"
+#       rm -rf /tmp/scratch
+#     on_nonzero_exit: warn      # 'fail' (default) | 'warn'

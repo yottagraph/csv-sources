@@ -1,0 +1,9 @@
+pyyaml>=6.0
+requests>=2.31
+
+# Uncomment and add what your job actually needs:
+# psycopg[binary]>=3.1     # Postgres (tenant DB) — DATABASE_URL env
+# google-cloud-bigquery>=3 # BigQuery (BC 2.0 analytical writes) — BIGQUERY_DATASET env
+# pandas>=2.0              # tabular work
+# google-cloud-storage>=2  # GCS reads/writes
+# google-cloud-aiplatform  # Vertex AI access

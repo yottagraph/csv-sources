@@ -1,0 +1,290 @@
+name: Deploy Compute Job
+on:
+    workflow_dispatch:
+        inputs:
+            job_name:
+                description: "Job directory name under jobs/ (e.g. example_job)"
+                required: true
+
+permissions:
+    contents: read
+    id-token: write
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Read config from broadchurch.yaml
+              id: config
+              run: |
+                  PROJECT=$(yq -r '.gcp.project' broadchurch.yaml)
+                  echo "project=${PROJECT}" >> "$GITHUB_OUTPUT"
+                  echo "region=$(yq -r '.gcp.region' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "project_name=$(yq -r '.tenant.project_name' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "org_id=$(yq -r '.tenant.org_id' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "service_account=$(yq -r '.tenant.service_account' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "gateway_url=$(yq -r '.gateway.url' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+                  echo "query_server_url=$(yq -r '.query_server.url' broadchurch.yaml)" >> "$GITHUB_OUTPUT"
+
+                  # BC 2.0: prefer the per-tenant github-deploy SA in the
+                  # tenant's own project (created by gcp-project.ts at
+                  # provisioning time). Fall back to <project>-default for
+                  # tenants where the YAML hasn't been re-rendered yet.
+                  GH_DEPLOY_SA=$(yq -r '.gcp.github_deploy_sa // ""' broadchurch.yaml)
+                  if [ -z "${GH_DEPLOY_SA}" ] || [ "${GH_DEPLOY_SA}" = "null" ]; then
+                    GH_DEPLOY_SA="github-deploy@${PROJECT}.iam.gserviceaccount.com"
+                  fi
+                  echo "github_deploy_sa=${GH_DEPLOY_SA}" >> "$GITHUB_OUTPUT"
+
+                  # BC 2.0: WIF pool lives in the BC Portal project
+                  # (prj-{env}-bc-portal-none-XXXX), not the legacy
+                  # broadchurch project. broadchurch.yaml carries
+                  # `gcp.wif_provider` (full resource name) when the
+                  # tenant was provisioned under BC 2.0.
+                  WIF_PROVIDER=$(yq -r '.gcp.wif_provider // ""' broadchurch.yaml)
+                  if [ -z "${WIF_PROVIDER}" ] || [ "${WIF_PROVIDER}" = "null" ]; then
+                    WIF_PROVIDER="projects/194773164895/locations/global/workloadIdentityPools/github-actions/providers/github"
+                  fi
+                  echo "wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+
+            - name: Validate job directory
+              run: |
+                  JOB_DIR="jobs/${{ inputs.job_name }}"
+                  if [ ! -d "${JOB_DIR}" ]; then
+                    echo "::error::Job directory ${JOB_DIR} does not exist"
+                    exit 1
+                  fi
+                  if [ ! -f "${JOB_DIR}/job.yaml" ]; then
+                    echo "::error::Job manifest ${JOB_DIR}/job.yaml not found"
+                    exit 1
+                  fi
+                  if [ ! -f "${JOB_DIR}/requirements.txt" ] && [ ! -f "${JOB_DIR}/Dockerfile" ]; then
+                    echo "::error::Job needs requirements.txt (default Dockerfile) or a custom Dockerfile"
+                    exit 1
+                  fi
+
+            # Validate the job manifest against the canonical schema
+            # (ENG-546). Emits normalized JSON to MANIFEST_JSON so
+            # downstream `jq` reads see defaults applied + types
+            # coerced consistently, and rejects unknown fields,
+            # malformed durations, secret-ref typos, etc. with
+            # pointing line-level errors. pyyaml install is ~1s.
+            - name: Validate job manifest
+              id: validate
+              run: |
+                  JOB_DIR="jobs/${{ inputs.job_name }}"
+                  python3 -m pip install --quiet --user pyyaml
+                  MANIFEST_JSON=$(python3 scripts/validate-job-manifest.py "${JOB_DIR}/job.yaml")
+                  echo "manifest<<EOF" >> "$GITHUB_OUTPUT"
+                  echo "${MANIFEST_JSON}" >> "$GITHUB_OUTPUT"
+                  echo "EOF" >> "$GITHUB_OUTPUT"
+
+            - name: Read job manifest
+              id: manifest
+              env:
+                  MANIFEST: ${{ steps.validate.outputs.manifest }}
+              run: |
+                  jqr() { jq -r "$1" <<<"$MANIFEST"; }
+                  echo "name=$(jqr .name)" >> "$GITHUB_OUTPUT"
+                  echo "runner=$(jqr .runner)" >> "$GITHUB_OUTPUT"
+                  echo "cpu=$(jqr .cpu)" >> "$GITHUB_OUTPUT"
+                  echo "memory=$(jqr .memory)" >> "$GITHUB_OUTPUT"
+                  echo "max_retries=$(jqr .max_retries)" >> "$GITHUB_OUTPUT"
+                  echo "task_timeout=$(jqr .task_timeout)" >> "$GITHUB_OUTPUT"
+                  echo "parallelism=$(jqr .parallelism)" >> "$GITHUB_OUTPUT"
+                  echo "task_count=$(jqr .task_count)" >> "$GITHUB_OUTPUT"
+                  echo "schedule=$(jqr .schedule)" >> "$GITHUB_OUTPUT"
+                  echo "schedule_timezone=$(jqr .schedule_timezone)" >> "$GITHUB_OUTPUT"
+                  echo "provisioning_model=$(jqr .provisioning_model)" >> "$GITHUB_OUTPUT"
+
+            # The K8s-Jobs dispatcher (Linear ENG-550 / PR-A3-v2) isn't
+            # wired into this workflow yet; fail fast with a clear
+            # message rather than silently submitting a K8s-shaped
+            # manifest to the Cloud Run Jobs deploy below.
+            - name: Reject K8s Jobs runner until dispatcher lands
+              if: steps.manifest.outputs.runner == 'k8s_job'
+              run: |
+                  echo "::error::runner: 'k8s_job' is declared in job.yaml but the K8s Jobs dispatcher isn't deployed yet (Linear ENG-550 / PR-A3-v2). Either switch to 'runner: cloud_run' or wait for the next platform release."
+                  exit 1
+
+            - uses: google-github-actions/auth@v2
+              with:
+                  workload_identity_provider: "${{ steps.config.outputs.wif_provider }}"
+                  service_account: "${{ steps.config.outputs.github_deploy_sa }}"
+
+            - uses: google-github-actions/setup-gcloud@v2
+
+            - name: Generate Dockerfile if missing
+              run: |
+                  JOB_DIR="jobs/${{ inputs.job_name }}"
+                  if [ ! -f "${JOB_DIR}/Dockerfile" ]; then
+                    cat > "${JOB_DIR}/Dockerfile" <<'DOCKERFILE'
+                  FROM python:3.12-slim
+                  WORKDIR /app
+                  RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libpq5 && rm -rf /var/lib/apt/lists/*
+                  COPY requirements.txt .
+                  RUN pip install --no-cache-dir -r requirements.txt
+                  COPY . .
+                  CMD ["python", "main.py"]
+                  DOCKERFILE
+                    echo "Generated default Dockerfile"
+                  fi
+
+            - name: Bundle broadchurch.yaml + shared utilities into job
+              run: |
+                  JOB_DIR="jobs/${{ inputs.job_name }}"
+                  cp broadchurch.yaml "${JOB_DIR}/broadchurch.yaml"
+                  if [ -f "agents/broadchurch_auth.py" ]; then
+                    cp agents/broadchurch_auth.py "${JOB_DIR}/"
+                    echo "Bundled broadchurch_auth.py into ${JOB_DIR}/"
+                  fi
+
+            - name: Build container
+              id: build
+              run: |
+                  JOB_NAME="${{ steps.manifest.outputs.name }}"
+                  IMAGE="gcr.io/${{ steps.config.outputs.project }}/job-${JOB_NAME}"
+                  echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+                  BUILD_ID=$(gcloud builds submit "jobs/${{ inputs.job_name }}/" \
+                    --project "${{ steps.config.outputs.project }}" \
+                    --tag "${IMAGE}" \
+                    --async --format='value(id)' \
+                    --quiet)
+                  echo "Submitted Cloud Build: ${BUILD_ID}"
+
+                  while true; do
+                    STATUS=$(gcloud builds describe "${BUILD_ID}" \
+                      --project "${{ steps.config.outputs.project }}" \
+                      --format='value(status)')
+                    echo "Build status: ${STATUS}"
+                    if [[ "${STATUS}" == "SUCCESS" ]]; then break; fi
+                    if [[ "${STATUS}" =~ ^(FAILURE|CANCELLED|TIMEOUT|INTERNAL_ERROR)$ ]]; then
+                      echo "::error::Cloud Build failed with status: ${STATUS}"
+                      exit 1
+                    fi
+                    sleep 15
+                  done
+
+            - name: Create or update Cloud Run Job
+              id: deploy
+              run: |
+                  JOB_NAME="${{ steps.manifest.outputs.name }}"
+                  PROJECT="${{ steps.config.outputs.project }}"
+                  REGION="${{ steps.config.outputs.region }}"
+
+                  # Common env injected for every job task. BC 2.0
+                  # adds BIGQUERY_DATASET / BIGQUERY_LOCATION so jobs
+                  # can write append-only result sets to the per-tenant
+                  # analytical dataset created by gcp-bigquery.ts. Both
+                  # are read from broadchurch.yaml; if absent (BC 1.0
+                  # tenant), they're left unset and downstream code
+                  # SHOULD treat them as optional.
+                  BQ_DATASET=$(yq -r '.gcp.bigquery_dataset // ""' broadchurch.yaml)
+                  BQ_LOCATION=$(yq -r '.gcp.bigquery_location // ""' broadchurch.yaml)
+                  ENV_VARS=(
+                    "ORG_ID=${{ steps.config.outputs.org_id }}"
+                    "GATEWAY_URL=${{ steps.config.outputs.gateway_url }}"
+                    "QUERY_SERVER_URL=${{ steps.config.outputs.query_server_url }}"
+                    "GOOGLE_CLOUD_PROJECT=${PROJECT}"
+                  )
+                  if [ -n "${BQ_DATASET}" ] && [ "${BQ_DATASET}" != "null" ]; then
+                    ENV_VARS+=("BIGQUERY_DATASET=${BQ_DATASET}")
+                  fi
+                  if [ -n "${BQ_LOCATION}" ] && [ "${BQ_LOCATION}" != "null" ]; then
+                    ENV_VARS+=("BIGQUERY_LOCATION=${BQ_LOCATION}")
+                  fi
+                  ENV_FLAG=$(printf '%s,' "${ENV_VARS[@]}" | sed 's/,$//')
+
+                  # `gcloud run jobs deploy` is idempotent: creates or updates as needed.
+                  gcloud run jobs deploy "${JOB_NAME}" \
+                    --project "${PROJECT}" \
+                    --region "${REGION}" \
+                    --image "${{ steps.build.outputs.image }}" \
+                    --service-account "${{ steps.config.outputs.service_account }}" \
+                    --cpu "${{ steps.manifest.outputs.cpu }}" \
+                    --memory "${{ steps.manifest.outputs.memory }}" \
+                    --max-retries "${{ steps.manifest.outputs.max_retries }}" \
+                    --task-timeout "${{ steps.manifest.outputs.task_timeout }}" \
+                    --parallelism "${{ steps.manifest.outputs.parallelism }}" \
+                    --tasks "${{ steps.manifest.outputs.task_count }}" \
+                    --set-env-vars "${ENV_FLAG}" \
+                    --quiet
+
+                  echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+                  echo "Deployed Cloud Run Job: ${JOB_NAME}"
+
+            - name: Configure Cloud Scheduler entry (if schedule set)
+              if: steps.manifest.outputs.schedule != ''
+              run: |
+                  JOB_NAME="${{ steps.manifest.outputs.name }}"
+                  PROJECT="${{ steps.config.outputs.project }}"
+                  REGION="${{ steps.config.outputs.region }}"
+                  SCHEDULER_NAME="job-${JOB_NAME}"
+                  CRON='${{ steps.manifest.outputs.schedule }}'
+                  TZ='${{ steps.manifest.outputs.schedule_timezone }}'
+                  SA='${{ steps.config.outputs.service_account }}'
+
+                  # Cloud Scheduler URL that triggers the job's Executions API
+                  RUN_URL="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${JOB_NAME}:run"
+
+                  # Create or update — Cloud Scheduler describe returns nonzero if absent
+                  if gcloud scheduler jobs describe "${SCHEDULER_NAME}" \
+                       --project "${PROJECT}" --location "${REGION}" >/dev/null 2>&1; then
+                    gcloud scheduler jobs update http "${SCHEDULER_NAME}" \
+                      --project "${PROJECT}" --location "${REGION}" \
+                      --schedule "${CRON}" \
+                      --time-zone "${TZ}" \
+                      --uri "${RUN_URL}" \
+                      --http-method POST \
+                      --oauth-service-account-email "${SA}" \
+                      --oauth-token-scope "https://www.googleapis.com/auth/cloud-platform" \
+                      --quiet
+                    echo "Updated Cloud Scheduler entry: ${SCHEDULER_NAME}"
+                  else
+                    gcloud scheduler jobs create http "${SCHEDULER_NAME}" \
+                      --project "${PROJECT}" --location "${REGION}" \
+                      --schedule "${CRON}" \
+                      --time-zone "${TZ}" \
+                      --uri "${RUN_URL}" \
+                      --http-method POST \
+                      --oauth-service-account-email "${SA}" \
+                      --oauth-token-scope "https://www.googleapis.com/auth/cloud-platform" \
+                      --quiet
+                    echo "Created Cloud Scheduler entry: ${SCHEDULER_NAME}"
+                  fi
+
+            - name: Remove Cloud Scheduler entry if schedule was cleared
+              if: steps.manifest.outputs.schedule == ''
+              run: |
+                  JOB_NAME="${{ steps.manifest.outputs.name }}"
+                  PROJECT="${{ steps.config.outputs.project }}"
+                  REGION="${{ steps.config.outputs.region }}"
+                  SCHEDULER_NAME="job-${JOB_NAME}"
+                  if gcloud scheduler jobs describe "${SCHEDULER_NAME}" \
+                       --project "${PROJECT}" --location "${REGION}" >/dev/null 2>&1; then
+                    gcloud scheduler jobs delete "${SCHEDULER_NAME}" \
+                      --project "${PROJECT}" --location "${REGION}" --quiet
+                    echo "Deleted Cloud Scheduler entry: ${SCHEDULER_NAME} (no schedule in manifest)"
+                  fi
+
+            - name: Register with Portal
+              run: |
+                  GATEWAY="${{ steps.config.outputs.gateway_url }}"
+                  ORG_ID="${{ steps.config.outputs.org_id }}"
+                  JOB_NAME="${{ steps.manifest.outputs.name }}"
+                  SOURCE_DIR="${{ inputs.job_name }}"
+                  SCHEDULE='${{ steps.manifest.outputs.schedule }}'
+
+                  curl -sf -X POST "${GATEWAY}/api/projects/${ORG_ID}/jobs" \
+                    -H "Content-Type: application/json" \
+                    -d "{
+                      \"job_name\": \"${JOB_NAME}\",
+                      \"source_dir\": \"${SOURCE_DIR}\",
+                      \"schedule\": \"${SCHEDULE}\",
+                      \"deployed_by\": \"github-actions\"
+                    }" || echo "::warning::Portal registration failed (job is deployed; UI may lag)"
+
+                  echo "Registered ${JOB_NAME} with Portal"
