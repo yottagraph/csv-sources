@@ -37,29 +37,93 @@ appropriate section below.
 - [ ] **Target users & primary use cases** — who is uploading CSVs, what
       data are they bringing in, and what do they want to do with it once
       it's in the graph?
-- [ ] **Scope of CSV inputs** — single canonical schema, a fixed set of
-      supported schemas, fully open-ended, or user-defined templates per
-      "source"?
-- [ ] **Column-to-ontology mapping UX** — how does a user say "this column
-      is the entity name, that column is the ticker, this one is a
-      relationship to an issuer entity, etc."? Manual UI, saved templates,
-      AI-assisted suggestions, or some mix?
-- [ ] **Source identity & re-upload semantics** — is each upload its own
-      source? Do uploads stack into a named "source"? What happens on
-      re-upload (replace, append, upsert by primary key)?
-- [ ] **Validation & preview flow** — what does the user see before they
-      commit an upload (sample rows, parsed entity preview, per-row
-      errors, dry-run extraction)?
-- [ ] **Ontology integration** — do we constrain users to existing
-      flavors/properties, allow new ones, or both? How do we surface the
-      Lovelace ontology to the user during mapping?
+- [x] **Scope of CSV inputs (answered by vision).** The model is
+      **N user-authored layouts per tenant**, each one a `{name,
+      column signature with required/optional headers, schema.yaml,
+      mapping rules}`. Not a fixed shipped vocabulary. See
+      "Project Overview § Product vision" above.
+
+- [x] **Column-to-ontology mapping UX (reframed by vision).** Mapping
+      is **layout-config-time**, not upload-time. The user authors
+      mapping rules once when defining a layout; at upload time
+      they just pick which layout the CSV is for and the system
+      applies the existing rules. Open sub-questions are now about
+      the **layout authoring experience**:
+      - [ ] **Authoring level.** Raw `schema.yaml` + raw mapping
+            rules YAML in a code editor (technical users), a
+            higher-level builder UI that produces both (non-
+            technical), or both (technical-first with a UI as a
+            future polish)?
+      - [ ] **Mapping rules format.** A sidecar YAML / JSON file?
+            Annotations inside the `schema.yaml`? A separate
+            `mapping.yaml` that references columns by header and
+            schema properties by name? Most likely a separate file,
+            but worth nailing the exact shape early.
+      - [ ] **Mapping rule expressiveness.** Minimum we need:
+            column → property on subject flavor (typed per schema);
+            column → strong-id-property; pairs of columns → link
+            with attrs; row → multiple records (one CSV row →
+            several entities and a relationship between them). Do
+            we also need: row filtering predicates, value transforms
+            (uppercase, parse-date, multiply-by), composite keys?
+
+- [ ] **Layout sharing & templates** — tenant-owned only, or do we
+      offer cross-tenant "template" layouts (e.g. "ERC-20 transfers",
+      "USDC transfers" pre-built) that a tenant can clone into their
+      own layout collection? P0 default: tenant-owned only, no
+      sharing. Templates are a clear P1 if customers want them.
+
+- [ ] **Schema namespace strategy** — `fetch-support` keys
+      `DatasetSchema` by `name`. Two tenants' layouts must not
+      collide in the global namespace. Proposed scheme:
+      `csv-sources-{tenant-org-id}-{layout-slug}`. **Pending
+      confirmation.**
+
+- [ ] **Source identity & re-upload semantics** — given the layout
+      model, the natural answer is "each layout is its own
+      `source` in the dialect; uploads under that layout share
+      that `source` but get distinct `pipeline` / `key` values".
+      Sub-questions:
+      - Re-upload of the same file: replace (same `key`), append
+        (new `key`), or refuse (configurable)?
+      - Upsert semantics for entities the layout produces — the
+        `strong_id_property` handles natural upsert via entity
+        resolution; do we need anything beyond that?
+
+- [x] **Ontology integration (answered by vision).** No fixed
+      vocabulary. Each layout's schema is self-contained. **Open
+      sub-question:** do we offer any guardrails on the schema the
+      user authors (lint rules, suggested flavor/property naming
+      patterns, schemacheck-style cross-layout consistency
+      warnings) or is anything goes?
+
+- [ ] **Validation & preview flow** — given a chosen layout, what
+      does the user see before they commit an upload? Pre-upload:
+      check the column signature matches the layout (required
+      present, optional recognized, no unknown columns), preview
+      the first N rows, optionally show a dry-run preview of the
+      entities/relationships that would be produced. Post-upload:
+      surface `fetch-support` validation errors back to the UI
+      with row / column context.
+
 - [ ] **Provenance & lineage** — how do ingested entities/properties
-      track back to the originating CSV file, row, column, and user?
-- [ ] **File constraints** — max size, encoding (UTF-8 only?), delimiter
-      detection, header handling, quoted fields, common dialect quirks
-      (Excel-exported CSVs, BOMs, etc.).
-- [ ] **Auth & tenant isolation** — confirm Auth0 + per-tenant Firestore /
-      Postgres / GCS scoping. Who can see / re-run / delete a source?
+      track back to the originating CSV file, row, column, and
+      user? `citation` in the v0 dialect is request-level; we may
+      want every record's `citation` to include the source URL
+      pointing to a per-row reference (e.g.
+      `aether://csv-sources/{tenant}/{layout}/{upload-id}#row-N`).
+
+- [ ] **File constraints** — max size, encoding (UTF-8 only?),
+      delimiter detection, header handling, quoted fields, common
+      dialect quirks (Excel-exported CSVs, BOMs, mixed line
+      endings, etc.). The CSV parser library choice is a P0
+      decision (Go `encoding/csv` is decent but doesn't sniff
+      dialect; `github.com/dimchansky/utfbom` for BOM stripping
+      is small).
+
+- [ ] **Auth & tenant isolation** — confirm Auth0 + per-tenant
+      Firestore / Postgres / GCS scoping. Who can see / re-run /
+      delete a layout, an upload, a published `.binpb.zst`?
 
 ### Technical plan (depends on items above)
 
@@ -166,12 +230,32 @@ appropriate section below.
       upload endpoint or a `schema_yaml` field on each
       `PublishRequest`; both are designed but not yet implemented.
 
-- [ ] **Schema sync workflow** — even given P0 mirroring, we still
-      need an operational answer: where does the canonical
-      `csv-sources/schema.yaml` live, how do we get it into the
-      deployed `fetch-support`'s schemas dir, and how do schema
-      changes propagate (PR to the lovelace repo? a CI job? a manual
-      copy?). Tied to the deployment-plan decision above.
+- [ ] **Schema sync workflow (now critical path).** Earlier draft
+      assumed a single, mostly-static `csv-sources/schema.yaml`
+      that could be PR'd into `fetch-support`'s `--schemas-dir`.
+      The layout vision changes this: schemas are **user-authored on
+      a live system**, one per layout, possibly many per tenant,
+      created/updated continuously. The P0 mirror-into-directory
+      mechanism does not work cleanly for this. Options:
+
+      1. **Land `fetch-support`'s P1 schema-sync mechanism first.**
+         PR #9935's `project-plan.md` describes either a
+         `POST /fetch/schemas/{source}` upload endpoint or a
+         `schema_yaml` field on each `PublishRequest`. Either would
+         let us push a schema from this app at layout-save time (or
+         per-publish). **This is now the most natural answer.**
+      2. **Build a custom schema-sync side channel.** Have this
+         app write schemas to a GCS prefix `fetch-support` watches
+         and periodically reloads. Requires modifying
+         `fetch-support` to watch + hot-reload.
+      3. **Restart `fetch-support` on every schema change.**
+         Operationally painful; unworkable above a few changes per
+         day.
+
+      **Strong default: option 1.** This adds an upstream
+      dependency to the CSV Sources roadmap — see the
+      "Landing strategy" question under the deployment plan
+      below.
 
 - [ ] **Storage layout (CSV-specific)** — where exactly do raw CSVs
       live in GCS? Options:
@@ -202,19 +286,18 @@ appropriate section below.
       immediately, so we don't hit request timeouts. P0 can use the
       Service directly; revisit when we know our file-size envelope.
 
-- [ ] **Dataset schema strategy** — same question as before, but now
-      narrower: do we ship a single `schema.yaml` defining a fixed
-      vocabulary the CSV mapping UI exposes, or generate a per-source
-      `schema.yaml` from each user mapping and register it with
-      `fetch-support` at upload time? P0 default: **one shipped
-      schema** with a useful starter vocabulary; per-source dynamic
-      schemas are a clear P1.
+- [x] **Dataset schema strategy (answered by vision).** **N
+      user-authored schemas, one per layout, stored per-tenant**
+      inside this app. Not one shipped schema. Each layout owns
+      its own `schema.yaml`. This is the central thing the layout
+      editor produces / edits / validates.
 
-- [ ] **Source identity model** — open. Easiest: one `source: "csv"`
-      with a `pipeline` per user-defined source (the dialect already
-      carries `pipeline`). Alternative: each user-defined source is a
-      separately-registered "source" inside `fetch-support`. P0
-      default: single `source` constant, per-source `pipeline` value.
+- [x] **Source identity model (answered by vision).** **One
+      `source` value per layout.** The naming convention is
+      effectively the schema namespace question above —
+      `csv-sources-{tenant-org-id}-{layout-slug}` is the working
+      proposal. `pipeline` either matches `source` (simplest) or
+      partitions further (e.g. `{layout-slug}/{upload-id}`).
 
 - [ ] **Quality gates (per-upload validation)** — the prototype relies
       on `fetch-support` returning errors when records fail schema
@@ -262,13 +345,84 @@ external API, its inputs come from user-uploaded files. Each upload
 should result in entities, properties, and relationships appearing in
 the graph with proper provenance back to the originating file and user.
 
-> Detailed product scope (target users, supported CSV shapes, mapping
-> UX, etc.) is still to be defined — see "Planning TODOs" above.
+### Product vision: layouts, not a single schema
+
+> **Authoritative vision statement.** The product is built around
+> _user-authored CSV layouts_, not a fixed vocabulary. The points
+> below are the source of truth — earlier sections that contradict
+> them are out of date and being reconciled.
+
+The core abstraction is a **CSV Layout**. A layout is a
+user-configured definition of "what one of my CSVs looks like and
+what it should produce in the knowledge graph". Each layout carries:
+
+- A **name** and human-readable description (e.g. "Monthly customer
+  export", "Q3 broker transactions").
+- A **column signature** — the set of column headers the layout
+  accepts, marked as **required** or **optional**.
+- A **dataset schema** (`schema.yaml` in the same shape as canonical
+  Lovelace fetch sources) — flavors, properties, relationships,
+  attributes, mergeability, `strong_id_properties`.
+- **Mapping rules** that say how each CSV column populates the
+  schema's entities, properties, relationships, and attributes
+  (e.g. "column `customer_id` is the `strong_id_property` for a
+  `customer` flavor"; "columns `from_addr` + `to_addr` produce an
+  `address_to_address` relationship with `amount` and `txid` as
+  attributes").
+
+A user can configure **N layouts** in their tenant. They are managed
+inside this app — authored, edited, versioned, owned by the user (and
+the tenant), and stored per-tenant.
+
+The **upload flow** is then:
+
+1. User picks **which layout** they're uploading against.
+2. App validates the CSV against the layout's column signature
+   (required columns present, optional columns recognized, no
+   unknown columns unless we choose to allow them).
+3. App writes the raw CSV to the raw bucket alongside layout-
+   identity metadata.
+4. Eventarc fires; the extract Cloud Run service reads the CSV +
+   layout-identity, applies the layout's mapping rules to produce
+   the v0 dialect `PublishRequest`, and POSTs to `fetch-support`.
+5. `fetch-support` looks up the layout's `schema.yaml`, translates
+   to `FetchMessage`, validates, writes `.binpb.zst`. IngestNG
+   picks it up.
+
+Key consequences:
+
+- **There is no fixed CSV Sources vocabulary.** Every layout has its
+  own dataset schema, authored by the user. Two layouts in the
+  same tenant — and certainly across tenants — can declare
+  completely different flavors and properties.
+- **Each layout ends up looking like its own fetch source** from
+  the perspective of `fetch-support`: it needs its own entry in
+  `fetch-support`'s schemas (registered by `name`), its own `source`
+  value in the dialect, and its own ingest glob registration with
+  IngestNG. **Schema name collisions across tenants must be
+  avoided** — assume layout schemas are namespaced (e.g.
+  `csv-sources-{tenant-org-id}-{layout-id}`) unless we choose
+  otherwise.
+- **The P0 schema-sync mechanism becomes a real problem.**
+  `fetch-support` loads schemas from `--schemas-dir` at startup and
+  doesn't reload — but users are authoring new schemas live in
+  this app. We almost certainly need PR #9935's planned P1 schema
+  upload endpoint (`POST /fetch/schemas/{source}`) or
+  `schema_yaml`-on-request mechanism to land before this app can
+  ship to production. **This is now critical path.**
+- **The Aether app's primary surface is the Layout Editor**, not
+  the upload form. The upload UI is conceptually a small modal:
+  pick a layout, pick a file, submit. Most of the product
+  complexity is the layout authoring experience.
+
+> Detailed open product questions (authoring level, layout sharing
+> model, mapping-rules format, etc.) live in "Planning TODOs § Product
+> definition" above.
 
 **Created:** 2026-05-24
 **App ID:** csv-sources
 **Description:** Aether app: CSV Sources — user-uploaded CSVs as a fetch source for the Elemental Knowledge Graph.
-**Last updated:** 2026-05-26 (added `fetch-support` service findings from PR #9935 and landing-order strategies)
+**Last updated:** 2026-05-26 (added layout-based product vision: N user-authored layouts per tenant, each with its own schema and mapping rules)
 
 ## Configuration
 
@@ -792,7 +946,10 @@ csv-sources/                           ← this repo
     ├── go.mod                         ← independent Go module
     ├── go.sum
     ├── README.md
-    ├── schema.yaml                    ← CSV Sources dataset schema
+    ├── testdata/
+    │   └── example-layout/            ← example layout for tests
+    │       ├── schema.yaml
+    │       └── mapping.yaml
     ├── cmd/
     │   ├── download/                  ← (optional, P1) "from URL" puller
     │   ├── extract/                   ← Cloud Run Service: raw CSV → v0 JSON → fetch-support
@@ -801,7 +958,8 @@ csv-sources/                           ← this repo
     │   └── csv/
     │       ├── storage.go             ← gs:// + file:// Store (copy of prototype)
     │       ├── parse.go               ← CSV dialect detection, row iteration
-    │       ├── mapping.go             ← mapping model + apply
+    │       ├── layout.go              ← layout model (column signature + schema + mapping)
+    │       ├── mapping.go             ← apply mapping rules + dialect builder
     │       ├── publish.go             ← fetch-support HTTP client (copy of prototype)
     │       └── ...
     ├── Dockerfile.extract
@@ -810,6 +968,12 @@ csv-sources/                           ← this repo
     └── tf/
         └── main.tf
 ```
+
+There is no single `fetch-source/schema.yaml`. Layouts (each with
+its own `schema.yaml` + `mapping.yaml`) are **runtime data**
+authored in the Aether app and stored per-tenant; they are not
+checked into source control. The `testdata/` directory holds an
+example layout used by `cmd/devrun` and unit tests.
 
 Trade-offs:
 
@@ -857,27 +1021,47 @@ These pieces we should **copy almost verbatim** from
 
 The pieces that aren't in the prototype and we have to design:
 
-1. **The Aether upload flow** — pages, components, server routes,
-   per-tenant Firestore data model.
-2. **The CSV parser + mapping engine** — `internal/csv/parse.go`,
-   `internal/csv/mapping.go`. Has to handle realistic CSV dialect
-   variation (Excel exports, BOMs, quoted commas, dates in mixed
-   formats, etc.).
-3. **The dialect builder driven by user mapping** — translates `(CSV
-   row, mapping)` into a list of v0 dialect `Record`s. The
-   prototype's equivalent (`internal/erc20/json.go`
-   `BuildPublishRequest`) is fully _domain-specific_; ours has to
-   be _generic_, driven by the mapping configuration.
-4. **The mapping configuration model** — the JSON / YAML schema for
-   "this column is the entity name; that column is a property of
-   type X; this column is a relationship target keyed by Y", plus a
-   UI to author it.
-5. **Validation error surfacing** — fetch-support returns
-   validation errors; we need to capture them, persist them, and
-   show them in the Aether UI.
-6. **Per-tenant identity flowing through to provenance** — the
-   `citation` field in the dialect should point back to "user X,
-   tenant Y, upload Z, row N".
+1. **The Layout Editor UI** — the primary surface of the Aether
+   app. Lets the user author a layout: name, column signature
+   (required + optional headers), `schema.yaml` (flavors,
+   properties, relationships, attributes, mergeability,
+   strong_id_properties), and mapping rules tying CSV columns to
+   schema elements. Open question (in TODOs): raw YAML editing vs.
+   higher-level builder UI.
+2. **The mapping rules format** — a separate per-layout file
+   (working assumption) that pairs CSV column headers with schema
+   elements: which column is the subject's `key`, which columns
+   become `props`, which pairs become `links` with `attrs`,
+   etc. The dialect builder reads this at extract time.
+3. **The per-tenant layout store** — Firestore documents holding
+   `{layoutId, name, columnSignature, schemaYaml, mappingRules,
+   createdBy, createdAt, ...}`, scoped per tenant via the standard
+   Aether `useAppPrefs` / `useAppFeaturePrefs` plumbing or a
+   dedicated collection.
+4. **The schema-sync bridge to `fetch-support`** — see the
+   "Schema sync workflow" TODO. Whatever mechanism we choose
+   (P1 upload endpoint, GCS watch, etc.) lives here.
+5. **The CSV upload flow** — small modal UI: pick layout, pick
+   file, submit. Pre-upload validation against the layout's column
+   signature. Server route writes the file + layout-identity
+   metadata to the raw bucket.
+6. **The generic dialect builder driven by `(layout, CSV row)`** —
+   the prototype's `internal/erc20/json.go::BuildPublishRequest` is
+   domain-specific; ours is fully data-driven. Given a layout's
+   mapping rules and a row of CSV cells, produce one or more v0
+   dialect `Record`s with the right `type` / `key` / `props` /
+   `links` / `attrs`.
+7. **The CSV parser** — `internal/csv/parse.go`, handling
+   realistic dialect variation (Excel exports, BOMs, quoted
+   commas, mixed line endings, optional date inference).
+8. **Validation error surfacing** — `fetch-support` returns
+   per-record validation errors on 400. We capture, persist, and
+   show them in the Aether UI with row / column context.
+9. **Per-tenant identity flowing through to provenance** — the
+   `citation` field in the dialect should point back to "tenant Y,
+   layout L, upload Z, row N", e.g. via an
+   `aether://csv-sources/{tenant}/{layout}/{upload}#row-{n}`
+   pseudo-URL.
 
 ## Cross-Cutting Concepts
 
