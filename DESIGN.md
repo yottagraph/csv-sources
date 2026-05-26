@@ -119,20 +119,59 @@ appropriate section below.
       `fetch-support`, and it owns writing into the extract bucket
       and registering the ingest glob.
 
-- [ ] **`fetch-support` deployment & endpoint** — the prototype README
-      links to `moongoose/cmd/fetch-support/api/README.md` in the
-      lovelace monorepo, but that path does not exist on `main` yet
-      (as of this research). We need to confirm with you:
-      (a) where `fetch-support` lives today (branch / repo / deployed
-      URL), (b) whether the v0 dialect is stable enough to commit
-      against, and (c) whether the Broadchurch tenant has Auth0 (or
-      other) credentials wired to call it.
+- [x] **`fetch-support` location & dialect stability (answered by PR
+      #9935).** `fetch-support` is implemented in
+      [Lovelace-AI/lovelace#9935](https://github.com/Lovelace-AI/lovelace/pull/9935)
+      ("Isolated-fetch prototype", branch `will/isolated-fetch-design`,
+      open, +2554 lines, mergeable but `behind main`). It lives at
+      `moongoose/cmd/fetch-support/` in that branch and is **local-only
+      in P0** — the PR explicitly does **not** deploy it. The v0
+      dialect is documented in `moongoose/cmd/fetch-support/api/README.md`
+      and codified in `api/types.go`; the prototype's
+      `internal/erc20/json.go` is a faithful mirror, so the dialect we
+      already documented is correct and current. **See "Lovelace-side
+      dependency: the `fetch-support` service" below.**
 
-- [ ] **Schema registration** — the prototype ships a `schema.yaml`
-      that has to match what `fetch-support` knows. **Open question:**
-      how do we register our `schema.yaml` with `fetch-support`? Does
-      it pull schemas from a known location, or do we hand it the
-      file at deploy time?
+- [ ] **`fetch-support` deployment plan** — to go to production we
+      need a reachable, authenticated `fetch-support` endpoint. The
+      P1 plan in PR #9935's
+      `experimental/will/isolated_fetch/project-plan.md` calls for:
+      - promoting `fetch-support` from local-only to a deployed
+        service on **gcp-newgate** (Helm chart, ArgoCD app, TF
+        callsite, behind caddy-mcp),
+      - adding **Auth0 `client_credentials`** enforcement via the
+        existing M2M minter with a new `audience=fetch-services`,
+      - switching the publish backend from local FS to GCS with a
+        per-environment publish bucket.
+      Options for us, in order of preference:
+      1. **Land PR #9935, then do P1 deploy, then build CSV Sources
+         on top.** Cleanest. Aligns with the upstream plan.
+      2. **Land PR #9935, then run our own private `fetch-support`
+         Cloud Run instance in the broadchurch project** (build the
+         binary, push the image, deploy alone). Faster to unblock us
+         but creates a parallel deploy of a service that should be
+         centralized.
+      3. **Don't merge PR #9935; just run `fetch-support` locally**
+         during CSV Sources dev. Fine for design + dev. Can't ship.
+      **Pending decision from you** — see "Lovelace-side dependency"
+      below for the trade-offs.
+
+- [x] **Schema registration (answered by PR #9935).** `fetch-support`
+      loads schemas from a `--schemas-dir` at startup — every
+      `*.yaml` is parsed as `dataschema.DatasetSchema` and keyed by
+      the `name` field. **P0 mechanism is to mirror our
+      `schema.yaml` into `fetch-support`'s `--schemas-dir`** (a
+      filesystem deploy concern, not a runtime API). P1 plan
+      (project-plan.md) discusses either a `POST /fetch/schemas/{source}`
+      upload endpoint or a `schema_yaml` field on each
+      `PublishRequest`; both are designed but not yet implemented.
+
+- [ ] **Schema sync workflow** — even given P0 mirroring, we still
+      need an operational answer: where does the canonical
+      `csv-sources/schema.yaml` live, how do we get it into the
+      deployed `fetch-support`'s schemas dir, and how do schema
+      changes propagate (PR to the lovelace repo? a CI job? a manual
+      copy?). Tied to the deployment-plan decision above.
 
 - [ ] **Storage layout (CSV-specific)** — where exactly do raw CSVs
       live in GCS? Options:
@@ -229,7 +268,7 @@ the graph with proper provenance back to the originating file and user.
 **Created:** 2026-05-24
 **App ID:** csv-sources
 **Description:** Aether app: CSV Sources — user-uploaded CSVs as a fetch source for the Elemental Knowledge Graph.
-**Last updated:** 2026-05-26 (added Broadchurch prototype findings + Adapting the prototype to CSV Sources)
+**Last updated:** 2026-05-26 (added `fetch-support` service findings from PR #9935 and landing-order strategies)
 
 ## Configuration
 
@@ -557,6 +596,133 @@ external API ──HTTP──▶ cmd/download (Cloud Run Job, scheduled)
   (the flag exists, enforcement is P1).
 - Retry/backoff for rate-limited downloads.
 - Per-chunk metrics / tracing.
+
+### Lovelace-side dependency: the `fetch-support` service
+
+> **Source:** [`Lovelace-AI/lovelace#9935`](https://github.com/Lovelace-AI/lovelace/pull/9935)
+> ("Isolated-fetch prototype", branch `will/isolated-fetch-design`,
+> open since 2026-05-06, +2554 lines, mergeable but `behind main`).
+> Read in this design: `docs/designs/isolated-fetch.md` (590 lines —
+> the umbrella architecture doc),
+> `experimental/will/isolated_fetch/project-plan.md` (236 lines — the
+> roadmap), and the entire `moongoose/cmd/fetch-support/` directory
+> (`README.md`, `api/README.md`, `api/types.go`, `main.go`,
+> `handler.go`, `schemastore.go`, `translator.go`, `testdata/`).
+
+This PR is the **umbrella architecture** behind the
+`lovelace-fetch-erc20` prototype. It introduces:
+
+1. A formal **"Isolated Fetch" design** (`docs/designs/isolated-fetch.md`)
+   that frames customer-side data sources as "zero access or visibility
+   to the core Lovelace codebase". Codifies ten Decision points
+   (D1–D10) including: customer code runs in the customer's GCP
+   project (D1); Auth0 `client_credentials` for HTTP M2M auth (D2);
+   wire format stays `FetchMessage` `.binpb.zst` (D4); customer-side
+   language is open / any-language (D6); P0 omits all deploy infra
+   (D8).
+2. The **`moongoose/cmd/fetch-support` HTTP service** itself —
+   ~320 lines of translator + ~136 lines of handler + ~82 lines of
+   schema store + main, plus golden tests. **`api/README.md` and
+   `api/types.go` are the canonical v0 dialect spec**, and they
+   match the prototype's mirror exactly (i.e. our documented dialect
+   is correct).
+3. A **project plan** with explicit P1 work for deploying
+   `fetch-support` and the supporting Auth0 / GCS infra.
+
+#### What `fetch-support` is
+
+A Go HTTP service that exposes two endpoints:
+
+| Endpoint | Behavior |
+|----------|----------|
+| `POST /fetch/publish` | Accepts a v0 dialect `PublishRequest`, looks up the schema by `source`, runs `Translate` (dialect → `FetchMessage` proto, typing props/attrs per schema, building flavor / property / relationship / attribute metadata maps), runs `dataschema.Validator.ValidateFetchMessage` (with the system schema merged in), writes a `.binpb.zst` to `{extract-store}/{pipeline-or-source}/{YYYY-MM-DD}/{key}.binpb.zst`. Returns `{uri, records}` on success, 400 on validation failure, 500 on storage error. |
+| `GET /healthz` | Returns 200 `ok`. |
+
+Configuration (via CLI flags on the binary):
+
+```
+fetch-support
+  --listen=:8080                                    # HTTP listen address
+  --extract-store=gs://...   OR  file:///abs/path   # where .binpb.zst lands
+  --schemas-dir=/path/to/schemas                    # *.yaml schema files loaded at startup
+```
+
+The translator is the heart of the service — it owns every piece of
+proto-level complexity our customer code would otherwise have to
+solve: setting `Record.Source`, building `ProtoEntity` subjects with
+the right `Flavor` / `Name` / `StrongIds` / `Aliases`, applying
+schema-derived mergeability (`MERGEABLE` for real-world flavors,
+`NOT_MERGEABLE` for passive ones), creating one `Atom` per property
+and one per link target, copying `Citation` / `SourceDownloadTimestamp`
+through to the `FetchMessage`, and building the four metadata maps
+the validator requires.
+
+#### Status (per the PR and project plan)
+
+- **PR state:** open since 2026-05-06, `behind main`, mergeable.
+  Author is `will-at-lovelace` (you). 17 files changed, +2554 -0
+  (one file modified is `moongoose/fetch/fetchlib/BUILD` for
+  visibility; everything else is new).
+- **P0 (in this PR) is "build & run locally; no deploy"** — the
+  service binary builds today, has golden tests, and is intended to
+  be run by a developer on their laptop alongside a local customer
+  app. No Helm chart, no ArgoCD config, no Auth0 middleware (the
+  flags are wired conceptually but enforcement is P1), no production
+  GCS bucket assignment.
+- **P1 (planned in `project-plan.md`, not yet in flight)** brings
+  the deploy:
+  - Promote `fetch-support` to a deployed service on **gcp-newgate**
+    (Helm chart in `prod/apps/`, ArgoCD app, TF callsite, behind
+    caddy-mcp).
+  - Add Auth0 `client_credentials` Bearer auth using existing
+    `mcplib` middleware, with a new `audience=fetch-services` in the
+    M2M minter config.
+  - Switch the publish backend to a per-environment GCS bucket.
+  - Optionally wrap `recordeval` for hosted validation diagnostics
+    returned inline on the publish response.
+  - Public Bearer-auth front-end on
+    `POST /ingest/addGlobRequest` so glob registration doesn't need
+    an FDE in the loop.
+- **Open questions blocking promotion** (also in `project-plan.md`):
+  bucket ownership for outputs (customer-owned vs Lovelace-owned),
+  deploy target choice, public auth on glob registration, source
+  registry catalog, customer secret store choice, schema sync model
+  (`--schemas-dir` mirror vs upload endpoint vs `schema_yaml` on
+  request).
+
+#### Why this matters for CSV Sources
+
+`fetch-support` is the **only** Lovelace-side service our app has to
+talk to in steady-state. **It is the dependency.** Without it
+running somewhere reachable and authenticated, our extract Cloud Run
+service has nothing to POST to and no data lands in the KG.
+
+This drives the **landing order** for the whole project:
+
+1. **PR #9935 merges into `lovelace` `main`.** Currently `behind
+   main`; needs a rebase. Pure additions in new files (apart from
+   one `+1 -0` BUILD visibility line), so the rebase should be
+   clean.
+2. **`fetch-support` P1 deploy work happens** (gcp-newgate Helm /
+   ArgoCD / TF, Auth0 audience, M2M client wiring, production GCS
+   bucket). Most of this is documented in
+   `experimental/will/isolated_fetch/project-plan.md § Next — P1`.
+3. **Broadchurch / CSV Sources picks up the deployed URL + Auth0
+   client_credentials** and we go end-to-end.
+
+Three viable strategies for us, in increasing order of "ship it
+fast at the cost of doing it twice":
+
+| Strategy | Pros | Cons |
+|----------|------|------|
+| **A. Land the upstream P1 first.** Get PR #9935 merged, do the gcp-newgate deploy, then build CSV Sources on top. | Single source of truth. Reuses the planned audience / minter / bucket. No duplicated service. | Couples our timeline to upstream P1 work; could be weeks of unrelated infra. |
+| **B. Run a private `fetch-support` in the broadchurch project.** Land PR #9935, then build the binary, push to broadchurch's Artifact Registry, deploy as a Cloud Run service alongside our extract service. Use a private Auth0 client, or no auth on a VPC-internal ingress. | Unblocks us today. Same code as upstream, just hosted differently. | Two deployed `fetch-support`'s long-term unless we migrate. Extra IAM / DNS / monitoring to babysit. Schema sync goes through us, not the central deploy. |
+| **C. Run `fetch-support` locally only.** Build and run on a developer laptop during CSV Sources dev. Use `file://` for the extract store; no IngestNG. | Zero deploy friction; perfect for design + dev iteration. | Can't ship to production. Can't validate the full KG round-trip. |
+
+**Strong default:** Strategy A if the upstream P1 work is on a
+reasonable timeline (weeks not months), otherwise Strategy B with an
+explicit plan to migrate to the central deploy when it lands.
+Strategy C is what we'll use during dev regardless.
 
 ### Adapting the prototype to CSV Sources
 
